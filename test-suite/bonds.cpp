@@ -1891,6 +1891,181 @@ BOOST_AUTO_TEST_CASE(testFixingConvention) {
     BOOST_CHECK_EQUAL(couponF->fixingDate(), expectedFollowing);
 }
 
+BOOST_AUTO_TEST_CASE(testYieldInFinalCouponPeriod) {
+    BOOST_TEST_MESSAGE(
+        "Testing that yield conventions agree in the final coupon period...");
+
+    // Settled inside the final coupon period, the only remaining payments
+    // are the last coupon and the redemption, both falling at maturity.
+    // With a single period left, "simple in the first period"
+    // (SimpleThenCompounded) and "simple in the last period"
+    // (CompoundedThenSimple) describe the same period, so both conventions
+    // must return the same simple yield.  Excel and Bloomberg agree on
+    // 1.349867886% for this bond.
+    Settings::instance().evaluationDate() = Date(5, March, 2026);
+
+    Date issue(1, June, 2016);
+    Date maturity(1, June, 2026);
+    Date settlement(5, March, 2026);
+
+    DayCounter dayCounter = ActualActual(ActualActual::ISMA);
+
+    Schedule schedule(issue, maturity, Period(Semiannual), NullCalendar(),
+                      Unadjusted, Unadjusted, DateGeneration::Backward, false);
+
+    FixedRateBond bond(0, 100.0, schedule,
+                       std::vector<Rate>(1, 0.02125),
+                       dayCounter, Unadjusted, 100.0, issue);
+
+    Bond::Price cleanPrice(100.185, Bond::Price::Clean);
+
+    Real yieldSTC = BondFunctions::yield(bond, cleanPrice, dayCounter,
+                                         SimpleThenCompounded, Semiannual, settlement);
+    ASSERT_CLOSE("simple-then-compounded yield", settlement,
+                 yieldSTC, 0.013498678862, 1e-9);
+
+    Real yieldCTS = BondFunctions::yield(bond, cleanPrice, dayCounter,
+                                         CompoundedThenSimple, Semiannual, settlement);
+    ASSERT_CLOSE("compounded-then-simple yield", settlement,
+                 yieldCTS, 0.013498678862, 1e-9);
+}
+
+// Checks the accrued interest, the clean price under each yield convention
+// and the round trip back to the 5% yield from those same prices.  The
+// solver guess is kept off the 5% root so that it has to iterate to it.
+void checkLongFirstCouponBond(const Bond& bond,
+                              const DayCounter& dayCounter,
+                              const Date& settlement,
+                              Real expectedAccrued,
+                              Real expectedPriceSTC,
+                              Real expectedPriceCTS) {
+    // The pricing functions below are all passed an explicit settlement
+    // date, but they fall back to the evaluation date when none is given.
+    // Pinning the two together keeps a case added later from drifting, at
+    // the cost of not being able to express one where the evaluation date
+    // is meant to differ from the settlement date.
+    Settings::instance().evaluationDate() = settlement;
+
+    Real accrued = BondFunctions::accruedAmount(bond, settlement);
+    ASSERT_CLOSE("accrued interest", settlement,
+                 accrued, expectedAccrued, 1e-8);
+
+    Real priceSTC = BondFunctions::cleanPrice(
+        bond, InterestRate(0.05, dayCounter, SimpleThenCompounded, Semiannual),
+        settlement);
+    ASSERT_CLOSE("simple-then-compounded price", settlement,
+                 priceSTC, expectedPriceSTC, 1e-8);
+
+    Real priceCTS = BondFunctions::cleanPrice(
+        bond, InterestRate(0.05, dayCounter, CompoundedThenSimple, Semiannual),
+        settlement);
+    ASSERT_CLOSE("compounded-then-simple price", settlement,
+                 priceCTS, expectedPriceCTS, 1e-8);
+
+    Real yieldSTC = BondFunctions::yield(
+        bond, Bond::Price(expectedPriceSTC, Bond::Price::Clean),
+        dayCounter, SimpleThenCompounded, Semiannual, settlement,
+        1e-10, 100, 0.02);
+    ASSERT_CLOSE("simple-then-compounded yield", settlement,
+                 yieldSTC, 0.05, 1e-9);
+
+    Real yieldCTS = BondFunctions::yield(
+        bond, Bond::Price(expectedPriceCTS, Bond::Price::Clean),
+        dayCounter, CompoundedThenSimple, Semiannual, settlement,
+        1e-10, 100, 0.02);
+    ASSERT_CLOSE("compounded-then-simple yield", settlement,
+                 yieldCTS, 0.05, 1e-9);
+}
+
+BOOST_AUTO_TEST_CASE(testYieldWithLongFirstCoupon) {
+    BOOST_TEST_MESSAGE(
+        "Testing yield conventions on a bond with a long first coupon...");
+
+    // The bond settles on its dated date, so the first coupon spans two
+    // quasi-coupon periods (w = 2) and accrued interest is zero.  At a
+    // yield of y = 5% with frequency m = 2, the flows remaining at the
+    // first coupon date come to exactly 105, so each convention collapses
+    // to one discounting step over the stub, with a closed form:
+    //   US Treasury (simple over the stub):    105 / (1 + w*y/m)  = 100.0
+    //   US street (compounded over the stub):  105 * (1+y/m)^(-w) = 99.9405116002
+    Date issue(1, January, 2026);
+    Date settlement = issue;
+
+    DayCounter dayCounter = ActualActual(ActualActual::ISMA);
+
+    Schedule schedule(std::vector<Date>{Date(1, January, 2026),
+                                        Date(1, January, 2027),
+                                        Date(1, July, 2027),
+                                        Date(1, January, 2028),
+                                        Date(1, July, 2028),
+                                        Date(1, January, 2029)});
+
+    FixedRateBond bond(0, 100.0, schedule,
+                       std::vector<Rate>(1, 0.05),
+                       dayCounter, Unadjusted, 100.0, issue);
+
+    checkLongFirstCouponBond(bond, dayCounter, settlement,
+                             0.0, 100.0, 99.9405116002);
+
+    // The second settlement is 90 days into the long first coupon.  The
+    // remaining time to the first coupon date is t = 275/365, so w = 2t
+    // ~ 1.5068 quasi-periods is fractional.  The same closed forms give
+    // the dirty prices
+    //   simple over the stub:      105 / (1 + w*y/m)  = 101.1881188119
+    //   compounded over the stub:  105 * (1+y/m)^(-w) = 101.1649450226
+    // with accrued interest of 100 * 5% * 90/365 = 1.2328767123.
+    // Note: the schedule is built from bare dates, so ActualActual(ISMA)
+    // has no reference periods for the long first coupon and falls back
+    // to Act/365-like fractions; the pinned values are the closed forms
+    // evaluated at these fractions.  The next test covers the same bond
+    // with the ICMA quasi-period fractions.
+    Date midSettlement(1, April, 2026);
+
+    checkLongFirstCouponBond(bond, dayCounter, midSettlement,
+                             1.2328767123, 99.9552420996, 99.9320683103);
+}
+
+BOOST_AUTO_TEST_CASE(testYieldWithLongFirstCouponAndQuasiPeriods) {
+    BOOST_TEST_MESSAGE(
+        "Testing yield conventions on a long first coupon with quasi-coupon periods...");
+
+    // Same bond as above, but with the schedule tagged with its tenor and
+    // its first period marked irregular.  ActualActual(ISMA) then has the
+    // quasi-coupon periods of the long first coupon (January 1st 2026 to
+    // July 1st 2026 to January 1st 2027) and returns true ICMA fractions
+    // rather than the Act/365-like fallback of the previous test.
+    Date issue(1, January, 2026);
+    Date settlement(1, April, 2026);
+
+    Schedule schedule(std::vector<Date>{Date(1, January, 2026),
+                                        Date(1, January, 2027),
+                                        Date(1, July, 2027),
+                                        Date(1, January, 2028),
+                                        Date(1, July, 2028),
+                                        Date(1, January, 2029)},
+                      NullCalendar(), Unadjusted, Unadjusted, Period(Semiannual),
+                      DateGeneration::Backward, false,
+                      std::vector<bool>{false, true, true, true, true});
+
+    DayCounter dayCounter = ActualActual(ActualActual::ISMA, schedule);
+
+    FixedRateBond bond(0, 100.0, schedule,
+                       std::vector<Rate>(1, 0.05),
+                       dayCounter, Unadjusted, 100.0, issue);
+
+    // 90 of the 181 days of the first quasi-coupon period have run, so
+    // accrued interest is 100 * 5% * 90/362 = 1.2430939227 and the time
+    // remaining to the first coupon date is t = 1 - 90/362, that is
+    // w = 2t ~ 1.5028 quasi-periods rather than the 1.5068 of the
+    // fallback fractions.  The flows at and after the first coupon date
+    // still come to exactly 105 at a 5% yield, so the closed forms give
+    // the dirty prices
+    //   US Treasury (simple over the stub):   105 / (1 + w*y/m)  = 101.1980830671
+    //   US street (compounded over the stub): 105 * (1+y/m)^(-w) = 101.1751546838
+    checkLongFirstCouponBond(bond, dayCounter, settlement,
+                             1.2430939227, 99.9549891444, 99.9320607612);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE_END()
